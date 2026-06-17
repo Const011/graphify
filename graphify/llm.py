@@ -113,6 +113,7 @@ BACKENDS: dict[str, dict] = {
         "default_model": os.environ.get("OPENAI_MODEL", "gpt-4.1-mini"),
         "env_key": "OPENAI_API_KEY",
         "model_env_key": "GRAPHIFY_OPENAI_MODEL",
+        "max_tokens": 16384,
         "pricing": {"input": 0.40, "output": 1.60},  # USD per 1M tokens
         # Default (gpt-4.1-mini) accepts temperature=0. Reasoning models
         # (o1/o3/o4/gpt-5) reject any explicit temperature and have it omitted
@@ -723,6 +724,92 @@ def _bedrock_content(user_message: str, refs: list[_ImageRef]) -> list[dict]:
     return content
 
 
+<<<<<<< HEAD
+=======
+_LLM_JSON_MAX_BYTES = 10 * 1024 * 1024  # 10 MB hard cap before json.loads (F-016)
+
+
+def _parse_llm_json(raw: str) -> dict:
+    """Strip optional markdown fences and parse JSON. Returns empty fragment on failure.
+
+    Caps the input at `_LLM_JSON_MAX_BYTES` so a hostile or runaway model
+    response cannot exhaust memory inside `json.loads` (F-016).
+    """
+    if len(raw) > _LLM_JSON_MAX_BYTES:
+        print(
+            f"[graphify] LLM response exceeds {_LLM_JSON_MAX_BYTES} bytes "
+            f"({len(raw)} bytes); refusing to parse and dropping chunk.",
+            file=sys.stderr,
+        )
+        return {"nodes": [], "edges": [], "hyperedges": []}
+    # Strategy 1: strip whitespace, then handle markdown fences anywhere in the
+    # text (not only at offset 0 — the original code only stripped fences when
+    # `raw.startswith("```")`, missing the common case where Claude prepends a
+    # preamble like "Here's the extracted entities:\n\n```json\n{...}\n```").
+    stripped = raw.strip()
+    fence_start = stripped.find("```")
+    if fence_start != -1:
+        after_fence = stripped[fence_start + 3 :]
+        # Optional language tag (json, JSON, javascript, etc.) up to newline.
+        nl = after_fence.find("\n")
+        if nl != -1 and after_fence[:nl].strip().lower() in {"json", "javascript", "js", ""}:
+            after_fence = after_fence[nl + 1 :]
+        fence_end = after_fence.rfind("```")
+        if fence_end != -1:
+            stripped = after_fence[:fence_end].strip()
+        else:
+            stripped = after_fence.strip()
+    try:
+        parsed = json.loads(stripped)
+        if isinstance(parsed, dict):
+            return parsed
+        # Top-level array/scalar (common LLM output) is not a usable graph
+        # fragment; fall through to the next strategy rather than returning a
+        # non-dict that callers will try to subscript (e.g. result["input_tokens"]).
+    except json.JSONDecodeError:
+        pass
+    # Strategy 2: extract the first balanced JSON object found anywhere in
+    # the text. Handles the case where Claude wraps the JSON in prose without
+    # any markdown fence ("The extracted graph is { ... }. Hope this helps!").
+    start = stripped.find("{")
+    if start != -1:
+        depth = 0
+        in_string = False
+        escape = False
+        for i in range(start, len(stripped)):
+            ch = stripped[i]
+            if escape:
+                escape = False
+                continue
+            if ch == "\\":
+                escape = True
+                continue
+            if ch == '"':
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        parsed = json.loads(stripped[start : i + 1])
+                        if isinstance(parsed, dict):
+                            return parsed
+                        break
+                    except json.JSONDecodeError:
+                        break
+    print(
+        f"[graphify] LLM returned invalid JSON, skipping chunk "
+        f"(first 200 chars: {raw[:200]!r})",
+        file=sys.stderr,
+    )
+    return {"nodes": [], "edges": [], "hyperedges": []}
+
+
+>>>>>>> v8
 def _response_is_hollow(raw_content: str | None, parsed: dict) -> bool:
     """Detect a successful HTTP response that yielded no usable extraction.
 
@@ -1314,8 +1401,19 @@ def extract_files_direct(
         mdl,
         user_msg,
         temperature=_resolve_temperature(cfg.get("temperature", 0), mdl),
+<<<<<<< HEAD
         reasoning_effort=cfg.get("reasoning_effort") if _supports_reasoning_effort(mdl) else None,
         max_completion_tokens=_resolve_max_tokens(cfg.get("max_completion_tokens", 8192)),
+=======
+        reasoning_effort=cfg.get("reasoning_effort"),
+        # Honour max_completion_tokens (gemini) or the older max_tokens key
+        # (ollama/deepseek/kimi/openai) -- most openai-compat configs define the
+        # latter, so reading only max_completion_tokens silently capped their
+        # output at the 8192 fallback and truncated deep-mode JSON (#1365).
+        max_completion_tokens=_resolve_max_tokens(
+            cfg.get("max_completion_tokens") or cfg.get("max_tokens", 8192)
+        ),
+>>>>>>> v8
         backend=backend,
         deep_mode=deep_mode,
         images=image_refs,

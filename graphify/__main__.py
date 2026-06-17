@@ -4480,9 +4480,6 @@ def main() -> None:
             # anchors emitted per importing file, #1327).
             from graphify.build import dedupe_edges as _dedupe_edges, dedupe_nodes as _dedupe_nodes
             from graphify.export import backup_if_protected as _backup
-<<<<<<< HEAD
-            from graphify.build import build_merge as _build_merge
-=======
             if (
                 incremental_mode
                 and not code_files
@@ -4513,7 +4510,6 @@ def main() -> None:
                     _e["source_file"] = (
                         _node_sf.get(_e.get("source")) or _node_sf.get(_e.get("target")) or ""
                     )
->>>>>>> v8
             _backup(graphify_out)
             if incremental_mode:
                 G = _build_merge(

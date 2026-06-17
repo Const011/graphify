@@ -724,8 +724,6 @@ def _bedrock_content(user_message: str, refs: list[_ImageRef]) -> list[dict]:
     return content
 
 
-<<<<<<< HEAD
-=======
 _LLM_JSON_MAX_BYTES = 10 * 1024 * 1024  # 10 MB hard cap before json.loads (F-016)
 
 
@@ -809,7 +807,6 @@ def _parse_llm_json(raw: str) -> dict:
     return {"nodes": [], "edges": [], "hyperedges": []}
 
 
->>>>>>> v8
 def _response_is_hollow(raw_content: str | None, parsed: dict) -> bool:
     """Detect a successful HTTP response that yielded no usable extraction.
 
@@ -1401,10 +1398,6 @@ def extract_files_direct(
         mdl,
         user_msg,
         temperature=_resolve_temperature(cfg.get("temperature", 0), mdl),
-<<<<<<< HEAD
-        reasoning_effort=cfg.get("reasoning_effort") if _supports_reasoning_effort(mdl) else None,
-        max_completion_tokens=_resolve_max_tokens(cfg.get("max_completion_tokens", 8192)),
-=======
         reasoning_effort=cfg.get("reasoning_effort"),
         # Honour max_completion_tokens (gemini) or the older max_tokens key
         # (ollama/deepseek/kimi/openai) -- most openai-compat configs define the
@@ -1413,7 +1406,6 @@ def extract_files_direct(
         max_completion_tokens=_resolve_max_tokens(
             cfg.get("max_completion_tokens") or cfg.get("max_tokens", 8192)
         ),
->>>>>>> v8
         backend=backend,
         deep_mode=deep_mode,
         images=image_refs,

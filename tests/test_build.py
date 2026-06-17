@@ -574,29 +574,6 @@ def test_build_merge_prune_windows_backslash_paths(tmp_path):
     assert "parse_date" not in node_labels, "node should be pruned even with backslash path"
 
 
-<<<<<<< HEAD
-def test_paths_missing_from_extraction_flags_empty_reextract(tmp_path):
-    """Incremental update must detect a file whose chunk returned no nodes."""
-    root = tmp_path / "corpus"
-    root.mkdir()
-    doc_a = root / "docs" / "a.md"
-    doc_b = root / "docs" / "b.md"
-    doc_a.parent.mkdir(parents=True)
-    doc_a.write_text("# A")
-    doc_b.write_text("# B")
-
-    empty = {"nodes": [], "edges": [], "hyperedges": []}
-    partial = {
-        "nodes": [{"id": "n1", "label": "A", "file_type": "document", "source_file": "docs/a.md"}],
-        "edges": [],
-        "hyperedges": [],
-    }
-    assert paths_missing_from_extraction(empty, [str(doc_a)], root) == [str(doc_a)]
-    assert paths_missing_from_extraction(partial, [str(doc_a)], root) == []
-    assert paths_missing_from_extraction(partial, [str(doc_b)], root) == [str(doc_b)]
-    assert path_covered_by_extraction(str(doc_a), partial, root)
-    assert not path_covered_by_extraction(str(doc_b), partial, root)
-=======
 def test_build_merge_replaces_changed_file_stale_edges(tmp_path):
     """Re-extracting a CHANGED file must REPLACE its prior nodes/edges, not
     accumulate them. build_merge previously only grew the graph, so an edge that
@@ -647,7 +624,6 @@ def test_build_merge_replaces_changed_file_stale_edges(tmp_path):
     # An unchanged file is untouched.
     assert "K" in labels, "unchanged file's node must survive"
     assert ("K", "A") in edges, "unchanged file's edge must survive"
->>>>>>> v8
 
 
 def test_build_merge_rejects_oversized_existing_graph(monkeypatch, tmp_path):

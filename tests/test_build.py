@@ -6,6 +6,8 @@ from graphify.build import (
     build_from_json,
     build,
     build_merge,
+    dedupe_edges,
+    dedupe_nodes,
     edge_data,
     edge_datas,
     path_covered_by_extraction,

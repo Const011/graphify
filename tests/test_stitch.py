@@ -123,6 +123,9 @@ def test_stitch_uses_new_node_ids_when_source_file_hallucinated(tmp_path: Path) 
         encoding="utf-8",
     )
 
+    # Only nodes whose source_file is missing/wrong for *array_md* — do not
+    # attribute nodes to another on-disk file (build_merge #1344 drops all nodes
+    # for every source_file present in the re-extract batch).
     hallucinated = {
         "nodes": [
             {
@@ -130,12 +133,6 @@ def test_stitch_uses_new_node_ids_when_source_file_hallucinated(tmp_path: Path) 
                 "label": "SprintArrayRenderer",
                 "file_type": "code",
                 "source_file": "nextjsapp/app/utils/components/tasks/ArrayFieldRenderer.tsx",
-            },
-            {
-                "id": "calendar_calculations_document",
-                "label": "Calendar Calculations",
-                "file_type": "document",
-                "source_file": "BoT-calendars-shared/src/CALENDAR_CALCULATIONS.md",
             },
         ],
         "edges": [],
@@ -147,10 +144,7 @@ def test_stitch_uses_new_node_ids_when_source_file_hallucinated(tmp_path: Path) 
         G,
         [str(array_md.relative_to(root))],
         root=root,
-        new_node_ids={
-            "array_field_renderer_SprintArrayRenderer",
-            "calendar_calculations_document",
-        },
+        new_node_ids={"array_field_renderer_SprintArrayRenderer"},
     )
     assert added == 1
     refs = [

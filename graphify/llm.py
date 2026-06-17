@@ -27,6 +27,7 @@ from graphify.file_slice import (
     unit_label,
     unit_path,
 )
+from graphify.llm_json_parser import parse_llm_json as _parse_llm_json
 
 # `_read_files` truncates each file at this many characters before joining into
 # the user message. Token estimates use the same cap so packing matches reality.
@@ -404,9 +405,14 @@ Mark uncertain ones AMBIGUOUS instead of omitting.
 
 def _extraction_system(*, deep: bool = False) -> str:
     """Return the semantic-extraction system prompt, optionally in deep mode."""
-    if not deep:
-        return _EXTRACTION_SYSTEM
-    return _EXTRACTION_SYSTEM + _DEEP_EXTRACTION_SUFFIX
+    prompt = _EXTRACTION_SYSTEM
+    if deep:
+        prompt += _DEEP_EXTRACTION_SUFFIX
+    extra = os.environ.get("GRAPHIFY_EXTRACTION_SUFFIX", "").strip()
+    if extra:
+        prompt += "\n" if not extra.startswith("\n") else ""
+        prompt += extra
+    return prompt
 
 
 def _file_to_text(path: Path) -> str:
@@ -717,81 +723,6 @@ def _bedrock_content(user_message: str, refs: list[_ImageRef]) -> list[dict]:
     return content
 
 
-_LLM_JSON_MAX_BYTES = 10 * 1024 * 1024  # 10 MB hard cap before json.loads (F-016)
-
-
-def _parse_llm_json(raw: str) -> dict:
-    """Strip optional markdown fences and parse JSON. Returns empty fragment on failure.
-
-    Caps the input at `_LLM_JSON_MAX_BYTES` so a hostile or runaway model
-    response cannot exhaust memory inside `json.loads` (F-016).
-    """
-    if len(raw) > _LLM_JSON_MAX_BYTES:
-        print(
-            f"[graphify] LLM response exceeds {_LLM_JSON_MAX_BYTES} bytes "
-            f"({len(raw)} bytes); refusing to parse and dropping chunk.",
-            file=sys.stderr,
-        )
-        return {"nodes": [], "edges": [], "hyperedges": []}
-    # Strategy 1: strip whitespace, then handle markdown fences anywhere in the
-    # text (not only at offset 0 — the original code only stripped fences when
-    # `raw.startswith("```")`, missing the common case where Claude prepends a
-    # preamble like "Here's the extracted entities:\n\n```json\n{...}\n```").
-    stripped = raw.strip()
-    fence_start = stripped.find("```")
-    if fence_start != -1:
-        after_fence = stripped[fence_start + 3 :]
-        # Optional language tag (json, JSON, javascript, etc.) up to newline.
-        nl = after_fence.find("\n")
-        if nl != -1 and after_fence[:nl].strip().lower() in {"json", "javascript", "js", ""}:
-            after_fence = after_fence[nl + 1 :]
-        fence_end = after_fence.rfind("```")
-        if fence_end != -1:
-            stripped = after_fence[:fence_end].strip()
-        else:
-            stripped = after_fence.strip()
-    try:
-        return json.loads(stripped)
-    except json.JSONDecodeError:
-        pass
-    # Strategy 2: extract the first balanced JSON object found anywhere in
-    # the text. Handles the case where Claude wraps the JSON in prose without
-    # any markdown fence ("The extracted graph is { ... }. Hope this helps!").
-    start = stripped.find("{")
-    if start != -1:
-        depth = 0
-        in_string = False
-        escape = False
-        for i in range(start, len(stripped)):
-            ch = stripped[i]
-            if escape:
-                escape = False
-                continue
-            if ch == "\\":
-                escape = True
-                continue
-            if ch == '"':
-                in_string = not in_string
-                continue
-            if in_string:
-                continue
-            if ch == "{":
-                depth += 1
-            elif ch == "}":
-                depth -= 1
-                if depth == 0:
-                    try:
-                        return json.loads(stripped[start : i + 1])
-                    except json.JSONDecodeError:
-                        break
-    print(
-        f"[graphify] LLM returned invalid JSON, skipping chunk "
-        f"(first 200 chars: {raw[:200]!r})",
-        file=sys.stderr,
-    )
-    return {"nodes": [], "edges": [], "hyperedges": []}
-
-
 def _response_is_hollow(raw_content: str | None, parsed: dict) -> bool:
     """Detect a successful HTTP response that yielded no usable extraction.
 
@@ -809,7 +740,8 @@ def _response_is_hollow(raw_content: str | None, parsed: dict) -> bool:
     nodes = parsed.get("nodes")
     edges = parsed.get("edges")
     hyperedges = parsed.get("hyperedges")
-    return not nodes and not edges and not hyperedges
+    finish_reason = parsed.get("finish_reason")
+    return not nodes and not edges and not hyperedges and finish_reason != "stop"
 
 
 def _backend_env_keys(backend: str) -> list[str]:

@@ -14,6 +14,7 @@ from unittest.mock import patch
 import pytest
 
 from graphify import llm
+from graphify.llm_json_parser import parse_llm_json
 
 
 # ---------- _parse_llm_json: the four canonical failure modes ----------
@@ -29,7 +30,7 @@ def test_preamble_then_fence_is_parsed():
         "Here are the extracted entities:\n\n"
         '```json\n{"nodes": [{"id": "a"}], "edges": []}\n```'
     )
-    result = llm._parse_llm_json(raw)
+    result = parse_llm_json(raw)
     assert result["nodes"] == [{"id": "a"}]
     assert result["edges"] == []
 
@@ -41,7 +42,7 @@ def test_prose_wrapped_json_without_fence_is_parsed():
         'The extracted graph is {"nodes": [{"id": "b"}], "edges": []}. '
         "Hope this helps!"
     )
-    result = llm._parse_llm_json(raw)
+    result = parse_llm_json(raw)
     assert result["nodes"] == [{"id": "b"}]
 
 
@@ -49,7 +50,7 @@ def test_raw_json_still_works():
     """Regression: clean JSON input (the original happy path) must keep
     parsing exactly as before."""
     raw = '{"nodes": [], "edges": [], "hyperedges": []}'
-    result = llm._parse_llm_json(raw)
+    result = parse_llm_json(raw)
     assert result == {"nodes": [], "edges": [], "hyperedges": []}
 
 
@@ -58,7 +59,7 @@ def test_total_refusal_returns_empty_fragment():
     must degrade gracefully — return the empty fragment so the hollow
     detector takes over, never raise."""
     raw = "I cannot extract structured data from this content."
-    result = llm._parse_llm_json(raw)
+    result = parse_llm_json(raw)
     assert result == {"nodes": [], "edges": [], "hyperedges": []}
 
 
@@ -67,7 +68,7 @@ def test_total_refusal_returns_empty_fragment():
 
 def test_fence_with_uppercase_language_tag():
     raw = '```JSON\n{"nodes": [{"id": "x"}], "edges": []}\n```'
-    result = llm._parse_llm_json(raw)
+    result = parse_llm_json(raw)
     assert result["nodes"] == [{"id": "x"}]
 
 
@@ -75,12 +76,36 @@ def test_fence_without_closing_backticks():
     """Truncated response: the model started the fence but ran out of
     tokens before closing it. We should still recover the JSON body."""
     raw = '```json\n{"nodes": [{"id": "y"}], "edges": []}'
-    result = llm._parse_llm_json(raw)
+    result = parse_llm_json(raw)
     assert result["nodes"] == [{"id": "y"}]
 
 
 def test_empty_response_returns_empty_fragment():
-    assert llm._parse_llm_json("") == {"nodes": [], "edges": [], "hyperedges": []}
+    assert parse_llm_json("") == {"nodes": [], "edges": [], "hyperedges": []}
+
+
+def test_split_nodes_and_edges_objects_are_merged():
+    """Gemma sometimes emits nodes and edges as two adjacent JSON objects."""
+    raw = (
+        '{"nodes": [{"id": "a", "label": "A", "file_type": "document", "source_file": "x.md"}]}'
+        '{"edges": [{"source": "a", "target": "b", "relation": "references", '
+        '"confidence": "EXTRACTED", "confidence_score": 1.0, "source_file": "x.md", "weight": 1.0}]}'
+    )
+    result = parse_llm_json(raw)
+    assert len(result["nodes"]) == 1
+    assert len(result["edges"]) == 1
+
+
+def test_split_envelope_missing_closing_brace_is_healed():
+    """Common Gemma failure: nodes array closes but the outer object does not."""
+    raw = (
+        '{"nodes": [{"id": "a", "label": "A", "file_type": "document", "source_file": "x.md"}]\n'
+        '{"edges": [{"source": "a", "target": "b", "relation": "references", '
+        '"confidence": "EXTRACTED", "confidence_score": 1.0, "source_file": "x.md", "weight": 1.0}]}'
+    )
+    result = parse_llm_json(raw)
+    assert len(result["nodes"]) == 1
+    assert len(result["edges"]) == 1
 
 
 # ---------- _call_claude_cli: argv shape ----------

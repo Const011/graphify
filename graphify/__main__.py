@@ -4465,9 +4465,10 @@ def main() -> None:
                 if _path_covered(str(p), sem_result, target)
             ]
             _changed_for_stitch = list(dict.fromkeys(_changed_code + [str(p) for p in semantic_files]))
-            _incremental_prune = (
-                list(dict.fromkeys(deleted_files + _changed_code + _changed_sem)) or None
-            )
+            # prune_sources is for deleted files only — build_merge already replaces
+            # re-extracted sources via new_sources in new_chunks. Including changed
+            # paths here strips freshly merged nodes (incremental doc add → +0 nodes).
+            _incremental_prune = list(dict.fromkeys(deleted_files)) or None
 
         if no_cluster:
             # --no-cluster: dump the raw merged extraction as graph.json.

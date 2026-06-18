@@ -20,12 +20,16 @@ _SPLIT_ENVELOPE_RE = re.compile(
     r"(\])\s*(\{\s*\"(?:edges|hyperedges)\"\s*:)",
     re.DOTALL,
 )
-# Gemma via Google OpenAI-compat sometimes prefixes JSON with a <thought> block.
+# Gemma via Google OpenAI-compat prefixes JSON with a <thought> reasoning block.
 _THOUGHT_BLOCK_RE = re.compile(r"<thought>.*?</thought>", re.IGNORECASE | re.DOTALL)
 
 
 def strip_model_thought_blocks(text: str) -> str:
-    """Remove model thinking preamble (Gemma ``<thought>…</thought>``) before JSON parse."""
+    """Remove Gemma ``<thought>…</thought>`` preamble before JSON parse.
+
+    Handles closed blocks and unclosed ``<thought>`` when a ``{`` JSON payload
+    follows. Returns empty string when only thinking text was emitted.
+    """
     cleaned = _THOUGHT_BLOCK_RE.sub("", text)
     stripped = cleaned.lstrip()
     if stripped.lower().startswith("<thought"):

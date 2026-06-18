@@ -35,12 +35,12 @@ python -m graphify extract {projectDir} --out {projectDir}/.pi/knowhow \
   --max-concurrency 4 --api-timeout 900
 ```
 
-Init (no **usable** graph+manifest): processor **removes** `.pi/knowhow/graphify-out/` first. Incremental: non-empty `graph.json` (≥1 node) **and** non-empty `manifest.json` — graphify then prints `incremental scan of …`.
+Init (no usable graph): processor **removes** `.pi/knowhow/graphify-out/` when `graph.json` is missing or has 0 nodes. Incremental: `graph.json` (≥1 node) **and** `manifest.json` file present — graphify then prints `incremental scan of …` (manifest may be `{}` until fork manifest fix is deployed).
 
 | Graph state | graphify mode | Knowhow phase |
 |-------------|---------------|---------------|
-| No `graph.json`, or empty graph (0 nodes), or empty `{}` manifest | Full semantic init (`scanning …`) | **init** — wipe `graphify-out/` |
-| Non-empty graph + non-empty manifest | Incremental semantic extract (clustered) | **incremental** |
+| No `graph.json`, or empty graph (0 nodes) | Full semantic init (`scanning …`) | **init** — wipe `graphify-out/` |
+| Non-empty `graph.json` + `manifest.json` exists | Incremental semantic extract (clustered) | **incremental** |
 
 **Do not** route knowhow markdown through `graphify update` — that path is AST/code-only (`watch._rebuild_code`) and skips semantic LLM extraction.
 
@@ -55,13 +55,21 @@ Init (no **usable** graph+manifest): processor **removes** `.pi/knowhow/graphify
 | `--api-timeout 900` | yes | Timeout |
 | Wipe `graphify-out/` before init | yes | Avoids stale cache; `reset_graphify_out()` on init |
 
-**Failed init (clustered):** When the LLM returns no parseable JSON, graphify exits 1 and writes **neither** `graph.json` nor `manifest.json`. The next run is a full scan. Knowhow also treats empty graph or empty manifest as init and wipes before retry (`graphify_cli.graphify_incremental_ready`).
+**Failed init (clustered):** When the LLM returns no parseable JSON, graphify exits 1 and writes **neither** `graph.json` nor `manifest.json`. Incremental re-extract failure aborts with `incremental update aborted — existing graph.json and manifest unchanged` (graph preserved).
 
-**Gemma `<thought>` preamble:** `gemma-4-31b-it` often prefixes JSON with `<thought>…</thought>`. Fork fix: `strip_model_thought_blocks()` in `llm_json_parser.py` before parse.
+**Gemma `<thought>` preamble:** `gemma-4-31b-it` emits `<thought>…</thought>` (or unclosed `<thought>` before JSON). Not `<think>` — that is Cursor UI labelling, not model output.
 
-**Fork fix (2026-06, local, upstream candidate):** Strip `<thought>…` preamble in `graphify/llm_json_parser.py` → `strip_model_thought_blocks()`.
+**Validated smoke (2026-06-18):** `graphify-test/run-smoke-gemma.sh` — clustered extract, no `--no-cluster`; 24 nodes, 16 links, 8 communities, 8/8 corpus files.
 
-Tests: `tests/test_llm_parser.py` (thought stripping).
+### Incidents fixed (2026-06-18, knowhow + fork)
+
+| Symptom | Root cause | Fix |
+|---------|------------|-----|
+| Extract succeeds but knowhow reports “graph.json missing or empty” | Clustered `graph.json` uses NetworkX node-link format (`links`, not `edges`); `GraphCounts.from_graph_json` required `edges` | Knowhow `graphify_run_log.py` — count `edges` or `links` |
+| Second promoted doc wipes graph, full re-init | After first extract, `manifest.json` was `{}`; knowhow required non-empty manifest → **init + reset** | Fork `__main__.py` manifest stamp + knowhow `graphify_incremental_ready()` aligned with graphify gate |
+| Incremental re-extract, tokens spent, graph delta +0 | `_incremental_prune` included re-extracted paths; `build_merge` `prune_sources` deleted fresh nodes | Fork `__main__.py` — `prune_sources=deleted_files` only |
+
+Knowhow patches (outside graphify git repo): `MVP6-knowledge-mgmt/ingest/knowhow/graphify_run_log.py`, `graphify_cli.py`, `graphify_trigger.py`; tests in `ingest/tests/test_graphify_*.py`.
 
 ### Google Gemini / Gemma (`backend=gemini`)
 
@@ -118,25 +126,54 @@ Other commits on the branch may include upstream merges (0.8.40, query skill, Ja
 |--------|---------|---------|---------------------|
 | **`GRAPHIFY_EXTRACTION_SUFFIX`** | `graphify/llm.py` → `_extraction_system()` | Append env-driven doc-mode rules without editing `_EXTRACTION_SYSTEM` | Yes — small, env-only |
 | **Accept intentional empty JSON** | `graphify/llm.py` → `_response_is_hollow()` | `return ... and finish_reason != "stop"` — model may return `{"nodes":[],"edges":[]}` when slice is code-only; do **not** bisect/retry | Yes — bugfix for doc extraction |
-| **Split JSON recovery** | `graphify/llm_json_parser.py` | Heal Gemma split envelopes (`{"nodes":[...]\n{"edges":[...]}`), merge multiple top-level JSON objects; imported by `llm.py` as `_parse_llm_json` | Yes — parser robustness for local models |
-| **Skip `reasoning_effort` for Gemma** | `graphify/llm.py` → `_call_openai_compat`, `_supports_reasoning_effort` | Gemma via `--backend gemini` rejects OpenAI-style thinking level; do not send `reasoning_effort` from `BACKENDS["gemini"]` | Yes — bugfix (#1326 note; still broken on upstream v8 extract path) |
-| **Strip Gemma `<thought>` preamble** | `graphify/llm_json_parser.py` | Parse JSON after thinking blocks | Yes — parser robustness |
-| **Manifest path alias on extract** | `graphify/__main__.py` → `_manifest_files` | Stamp semantic_hash using `path_covered_by_extraction` (detect uses absolute paths; LLM `source_file` is relative) | Yes — empty `{}` manifest bug |
+| **Split JSON recovery** | `graphify/llm_json_parser.py` | Heal Gemma split envelopes (`{"nodes":[...]\n{"edges":[...]}`), merge multiple top-level JSON objects | Yes — parser robustness (PR **#2** below) |
+| **Skip `reasoning_effort` for Gemma** | `graphify/llm.py` → `_call_openai_compat`, `_supports_reasoning_effort` | Gemma via `--backend gemini` rejects OpenAI-style thinking level | Yes — bugfix (PR **#3** or fold into Gemma bundle) |
+| **Strip Gemma `<thought>` preamble** | `graphify/llm_json_parser.py` → `strip_model_thought_blocks()` | Remove `<thought>…</thought>` / unclosed preamble before JSON parse | Yes — PR **#2** |
+| **Wire parser in `llm.py`** | `graphify/llm.py` | **Delete** duplicate `_parse_llm_json` (~80 lines) so `from graphify.llm_json_parser import parse_llm_json as _parse_llm_json` is used at runtime | Yes — PR **#2** (same PR as thought strip; shadowing made #2 ineffective until removed) |
+| **Manifest path alias on extract** | `graphify/__main__.py` → `_manifest_files` | Use `path_covered_by_extraction(f, sem_result, target)` instead of `f in _sem_extracted` — detect paths are absolute, LLM `source_file` is relative → upstream wrote `{}` manifest | Yes — **separate PR #1** (manifest-only) |
+| **Incremental prune_sources** | `graphify/__main__.py` → `_incremental_prune` | Pass **deleted files only** to `build_merge(prune_sources=…)`; re-extracted paths were pruned after merge → +0 nodes | Yes — **PR #4** |
 | **Debug prints** | `graphify/llm.py` → `_response_is_hollow()` | `[RAW CONTENT IS NULL]`, `[PARSED IS EMPTY]` | **Remove** before commit |
 
-**New module:** `graphify/llm_json_parser.py` — keep parser logic here (not inline in `llm.py`) so upstream merges on `llm.py` do not clobber recovery. Tests: `tests/test_llm_parser.py` imports `parse_llm_json` directly.
+**New module:** `graphify/llm_json_parser.py` — keep parser logic here (not inline in `llm.py`) so upstream merges on `llm.py` do not clobber recovery.
 
-Suggested commit message:
+**Tests (fork):**
+
+| Area | Tests |
+|------|-------|
+| Thought / split JSON / `llm` wiring | `tests/test_llm_parser.py` (incl. `test_llm_module_delegates_to_llm_json_parser`) |
+| Gemma `reasoning_effort` | `tests/test_llm_backends.py` |
+| Manifest stamp | **TODO** — add `tests/test_extract_manifest.py` before upstream PR **#1** (repro: absolute detect path + relative `source_file` → non-empty manifest) |
+
+---
+
+### Proposed upstream PR split (2026-06-18)
+
+Submit as **separate** PRs to safishamsi/graphify — easier review, independent merge:
+
+| PR | Title (suggested) | Files | Notes |
+|----|-------------------|-------|-------|
+| **#1 Manifest** | `fix(extract): stamp manifest when LLM source_file is relative` | `graphify/__main__.py`, new test | Bug: `_manifest_files` filtered with `f in _sem_extracted` (string equality). `detect()` yields `/abs/path/doc.md`; nodes carry `doc.md`. Manifest stayed `{}` → broken incremental. **Needs dedicated test before submit.** |
+| **#2 LLM JSON parser** | `fix(llm): robust JSON parse for Gemma thought blocks and split envelopes` | `graphify/llm_json_parser.py`, `graphify/llm.py` (import only, remove duplicate), `tests/test_llm_parser.py` | Includes `<thought>` strip, split-envelope heal, and **must** delete shadow `_parse_llm_json` in `llm.py`. |
+| **#3 Gemma API** | `fix(gemini): skip reasoning_effort for gemma-* models` | `graphify/llm.py`, `tests/test_llm_backends.py` | Small; can merge independently or with #2. |
+| **#4 Incremental prune** | `fix(extract): do not prune re-extracted sources in incremental merge` | `graphify/__main__.py`, `tests/test_build.py` | Bug: changed paths in `prune_sources` removed merged nodes. Test: `test_build_merge_prune_sources_deleted_only_not_reextracted`. |
+
+**Not upstream (GnttProject / knowhow):** clustered extract default, `GraphCounts` `links` support, `graphify_incremental_ready()` gate, processor logging — see MVP6 `ingest/knowhow/` and `MVP6-knowledge-mgmt/ARCHITECTURE.md` §11.3.
+
+Suggested commit messages (fork, before splitting PRs):
 
 ```
-fork: doc extraction suffix, hollow stop fix, split JSON parser
+fix(extract): stamp manifest using path_covered_by_extraction
 
-- Append GRAPHIFY_EXTRACTION_SUFFIX to extraction system prompt (env override).
-- Do not treat finish_reason=stop + empty nodes/edges as hollow truncation.
-- Add llm_json_parser.py: heal/merge split LLM JSON envelopes (Gemma/Ollama).
+detect() records absolute paths; LLM source_file is relative. Matching with
+set membership left semantic files out of _manifest_files → empty manifest.
 ```
 
-Add or extend tests in `tests/test_llm_parser.py` when committing.
+```
+fix(llm): use llm_json_parser for all extract paths; strip Gemma <thought>
+
+- Add strip_model_thought_blocks() for <thought> preamble.
+- Remove duplicate _parse_llm_json in llm.py that shadowed the import.
+```
 
 ---
 
@@ -151,8 +188,8 @@ These live in `GnttProject/` and survive upstream merges automatically:
 | `graphify/graphify.env` | Optional local overrides (if present) |
 | `graphify/run-extract.sh` | Production extract wrapper |
 | `graphify-test/smoke-extraction-env.sh` | **`GRAPHIFY_EXTRACTION_SUFFIX`** — DOCUMENT-ONLY MODE for markdown corpora |
-| `graphify-test/run-smoke-*.sh` | Smoke scripts (Ollama default `gemma4:4E`, 16k ctx) |
-| `graphify-test/analyze-traceability.py` | Corpus ↔ graph attribution checks |
+| `graphify-test/run-smoke-gemma.sh` | Gemma cloud smoke — **clustered** (no `--no-cluster`); validates fork on 8-file corpus |
+| `graphify-test/analyze-traceability.py` | Corpus ↔ graph attribution; accepts clustered `links` or flat `edges` |
 | `graphify-test/rebuild-graphify.sh` | `pip install -e` fork |
 
 ---
@@ -185,8 +222,9 @@ After merge:
 | File | Keep from |
 |------|-----------|
 | `file_slice.py`, `stitch.py` | **ours** (fork) unless upstream added equivalent |
-| `llm.py` OpenRouter / `BACKENDS` | **theirs** (upstream v8) + re-apply suffix + hollow fix + Gemma `reasoning_effort` guard + `from graphify.llm_json_parser import parse_llm_json` |
+| `llm.py` OpenRouter / `BACKENDS` | **theirs** (upstream v8) + re-apply suffix + hollow fix + Gemma `reasoning_effort` guard + **single** `from graphify.llm_json_parser import parse_llm_json as _parse_llm_json` (no local duplicate) |
 | `llm_json_parser.py` | **ours** (fork) — new file; safe unless upstream adds equivalent |
+| `__main__.py` `_manifest_files` | **ours** — `path_covered_by_extraction` manifest stamp (PR #1) |
 | `__main__.py`, `build.py` incremental | **ours** + integrate upstream CLI flags |
 | `skill*.md`, skillgen | usually **theirs**, re-run skillgen if needed |
 
@@ -243,6 +281,9 @@ git diff upstream/v8...HEAD --stat
 | 2026-06-16 | `llm_json_parser.py` — split JSON heal/merge for Ollama Gemma |
 | 2026-06-16 | Smoke: `gemma4:4E`, 16k ctx, DOCUMENT-ONLY suffix; 41-node corpus graph |
 | 2026-06-18 | Split #1326 → upstream PRs #1369 / #1370 / #1371 |
-| 2026-06-18 | Fork: strip Gemma `<thought>` in `llm_json_parser.py`; knowhow uses clustered extract |
+| 2026-06-18 | Knowhow: clustered extract; `links`/`edges` graph counts; incremental gate matches graphify |
+| 2026-06-18 | Fork: manifest stamp via `path_covered_by_extraction` (`__main__.py`) — **upstream PR #1 candidate** |
+| 2026-06-18 | Fork: `llm_json_parser` `<thought>` strip + remove shadow `_parse_llm_json` in `llm.py` — **upstream PR #2 candidate** |
+| 2026-06-18 | Fork: incremental `prune_sources` = deleted files only (`__main__.py`) |
 
 Update this table when committing fork patches or completing an upstream merge.

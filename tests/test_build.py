@@ -628,6 +628,50 @@ def test_build_merge_replaces_changed_file_stale_edges(tmp_path):
     assert ("K", "A") in edges, "unchanged file's edge must survive"
 
 
+def test_build_merge_prune_sources_deleted_only_not_reextracted(tmp_path):
+    """prune_sources removes nodes for listed paths — must not list re-extracted files.
+
+    __main__.py previously passed changed semantic paths into prune_sources; that
+    dropped freshly merged nodes and left the graph unchanged after a successful LLM call.
+    """
+    import networkx as nx
+
+    root = tmp_path / "corpus"
+    root.mkdir()
+    graph_path = tmp_path / "graph.json"
+
+    chunk0 = {
+        "nodes": [
+            {"id": "k1", "label": "Keep", "file_type": "document", "source_file": "keep.md"},
+        ],
+        "edges": [],
+    }
+    G0 = build([chunk0], dedup=False)
+    graph_path.write_text(json.dumps(nx.node_link_data(G0, edges="edges")), encoding="utf-8")
+
+    abs_new = str(root / "new.md")
+    new_chunk = {
+        "nodes": [
+            {"id": "n1", "label": "New concept", "file_type": "document", "source_file": abs_new},
+        ],
+        "edges": [],
+    }
+
+    G_ok = build_merge([new_chunk], graph_path, dedup=False, root=root)
+    assert G_ok.number_of_nodes() == 2
+
+    graph_path.write_text(json.dumps(nx.node_link_data(G0, edges="edges")), encoding="utf-8")
+    G_bad = build_merge(
+        [new_chunk],
+        graph_path,
+        prune_sources=[abs_new],
+        dedup=False,
+        root=root,
+    )
+    assert G_bad.number_of_nodes() == 1
+    assert "New concept" not in {d["label"] for _, d in G_bad.nodes(data=True)}
+
+
 def test_build_merge_rejects_oversized_existing_graph(monkeypatch, tmp_path):
     """#F4: build_merge must refuse to read an existing graph.json that
     exceeds the size cap, rather than json.loads-ing it into memory."""

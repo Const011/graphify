@@ -128,6 +128,18 @@ def test_unclosed_thought_prefix_before_json_is_stripped():
     assert len(result["nodes"]) == 1
 
 
+def test_llm_module_delegates_to_llm_json_parser():
+    """Regression: llm.py must not shadow parse_llm_json with a stale copy."""
+    from graphify import llm
+
+    raw = (
+        "<thought>* Input: context_scope_statement.txt\n"
+        '{"nodes": [{"id": "scope", "label": "Scope"}], "edges": []}'
+    )
+    result = llm._parse_llm_json(raw)
+    assert result["nodes"] == [{"id": "scope", "label": "Scope"}]
+
+
 # ---------- _call_claude_cli: argv shape ----------
 
 

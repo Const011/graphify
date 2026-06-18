@@ -7,9 +7,9 @@ Track **our** changes vs [upstream graphify](https://github.com/safishamsi/graph
 | `origin` | `git@github.com:Const011/graphify.git` | Our fork |
 | `upstream` | `https://github.com/safishamsi/graphify.git` | safishamsi master line (`v8` branch) |
 
-**Active branch:** `feat/incremental-stitch-file-slice` (PR [#1326](https://github.com/safishamsi/graphify/pull/1326), commit `e7f6a8e` + merges from upstream `v8`).
+**Active branch:** split PRs to upstream — see [PR status](#pr-status). Archive: `feat/incremental-stitch-file-slice`, `fork/archive/monolithic-pr-1326`.
 
-**Install in GnttProject:** `pip install -e BoT-assistant-shared/graphify` after `source graphify/env.sh` (see `graphify-test/rebuild-graphify.sh`).
+**Install in GnttProject:** `pip install -e BoT-assistant-shared/graphify` after `source graphify/env.sh` (see `graphify-test/rebuild-graphify.sh`). **Restart** pi-web / knowhow after reinstall so the processor picks up `llm.py` changes.
 
 ---
 
@@ -20,10 +20,73 @@ Track **our** changes vs [upstream graphify](https://github.com/safishamsi/graph
 | Local graph build (Ollama) | `gemma4:4E` |
 | Context | `OLLAMA_NUM_CTX=16384`, margin 2048 → token-budget ~7168 |
 | Doc corpus prompt | `graphify-test/smoke-extraction-env.sh` → `GRAPHIFY_EXTRACTION_SUFFIX` |
-| Cloud fallback | Google `gemma-4-31b-it` via `graphify/env.sh` |
+| Cloud fallback | Google `gemma-4-31b-it` via `graphify/env.sh` / `pi-web/start.sh` → `GRAPHIFY_GEMINI_MODEL` |
 | Smoke corpus | `graphify-test/corpus-smoke/` (8 markdown files) |
 
 Reference run: `ollama-gemma4-4E-smoke` — 41 nodes, 32 edges, 100% traceable, 8/8 files.
+
+### Knowhow processor (MVP6)
+
+The central knowhow processor (`MVP6-knowledge-mgmt/ingest/knowhow/processor.py`) **always** invokes:
+
+```bash
+python -m graphify extract {projectDir} --out {projectDir}/.pi/knowhow \
+  --backend gemini --model gemma-4-31b-it \
+  --max-concurrency 4 --api-timeout 900
+```
+
+Init (no **usable** graph+manifest): processor **removes** `.pi/knowhow/graphify-out/` first. Incremental: non-empty `graph.json` (≥1 node) **and** non-empty `manifest.json` — graphify then prints `incremental scan of …`.
+
+| Graph state | graphify mode | Knowhow phase |
+|-------------|---------------|---------------|
+| No `graph.json`, or empty graph (0 nodes), or empty `{}` manifest | Full semantic init (`scanning …`) | **init** — wipe `graphify-out/` |
+| Non-empty graph + non-empty manifest | Incremental semantic extract (clustered) | **incremental** |
+
+**Do not** route knowhow markdown through `graphify update` — that path is AST/code-only (`watch._rebuild_code`) and skips semantic LLM extraction.
+
+### Working extract flags (knowhow production)
+
+| Flag / env | Knowhow default | Effect |
+|------------|-----------------|--------|
+| `--backend gemini --model gemma-4-31b-it` | yes | Explicit backend when `GRAPHIFY_GEMINI_MODEL` is set |
+| `GRAPHIFY_EXTRACTION_SUFFIX` | yes (`smoke-extraction-env.sh`) | Document-only prompt rules |
+| Clustering | **on** (`KNOWHOW_GRAPHIFY_NO_CLUSTER=0`) | Community detection for search/navigation; failed init exits 1 with no graph/manifest |
+| `--max-concurrency 4` | yes | Throughput |
+| `--api-timeout 900` | yes | Timeout |
+| Wipe `graphify-out/` before init | yes | Avoids stale cache; `reset_graphify_out()` on init |
+
+**Failed init (clustered):** When the LLM returns no parseable JSON, graphify exits 1 and writes **neither** `graph.json` nor `manifest.json`. The next run is a full scan. Knowhow also treats empty graph or empty manifest as init and wipes before retry (`graphify_cli.graphify_incremental_ready`).
+
+**Gemma `<thought>` preamble:** `gemma-4-31b-it` often prefixes JSON with `<thought>…</thought>`. Fork fix: `strip_model_thought_blocks()` in `llm_json_parser.py` before parse.
+
+**Fork fix (2026-06, local, upstream candidate):** Strip `<thought>…` preamble in `graphify/llm_json_parser.py` → `strip_model_thought_blocks()`.
+
+Tests: `tests/test_llm_parser.py` (thought stripping).
+
+### Google Gemini / Gemma (`backend=gemini`)
+
+Production uses **`gemma-4-31b-it`** through Google’s OpenAI-compatible endpoint (`graphify/env.sh`, `MVP3-html-tui/pi-web/start.sh`).
+
+Upstream `BACKENDS["gemini"]` sets `"reasoning_effort": "low"` for the default **`gemini-3-flash-preview`**. That parameter is valid for Gemini Flash, but **Gemma models reject it**:
+
+```text
+400 INVALID_ARGUMENT: Thinking level is not supported for this model.
+```
+
+**Symptom:** knowhow / `graphify extract --backend gemini` fails every semantic chunk with the above error when `GRAPHIFY_GEMINI_MODEL=gemma-4-31b-it` (or any `gemma*` model).
+
+**Fork fix (`graphify/llm.py`):**
+
+- `_supports_reasoning_effort(model)` — returns `False` when the model id starts with `gemma` (after stripping an optional `provider/` prefix).
+- `_call_openai_compat` — only adds `reasoning_effort` to the API kwargs when `_supports_reasoning_effort(model)` is true.
+
+Previously the guard existed only on the **dedup** LLM path; **extract** still sent `reasoning_effort: "low"` and broke Gemma.
+
+**Tests:** `tests/test_llm_backends.py` — `test_call_openai_compat_skips_reasoning_effort_for_gemma`, `test_call_openai_compat_sends_reasoning_effort_for_gemini_flash`.
+
+**After changing `llm.py`:** `pip install -e BoT-assistant-shared/graphify` and restart the knowhow processor / pi-web.
+
+**Upstream:** same bug on `v8` @ 0.8.41 — candidate for a small follow-up PR to Safi (not in #1369–#1371 unless cherry-picked).
 
 ---
 
@@ -56,6 +119,9 @@ Other commits on the branch may include upstream merges (0.8.40, query skill, Ja
 | **`GRAPHIFY_EXTRACTION_SUFFIX`** | `graphify/llm.py` → `_extraction_system()` | Append env-driven doc-mode rules without editing `_EXTRACTION_SYSTEM` | Yes — small, env-only |
 | **Accept intentional empty JSON** | `graphify/llm.py` → `_response_is_hollow()` | `return ... and finish_reason != "stop"` — model may return `{"nodes":[],"edges":[]}` when slice is code-only; do **not** bisect/retry | Yes — bugfix for doc extraction |
 | **Split JSON recovery** | `graphify/llm_json_parser.py` | Heal Gemma split envelopes (`{"nodes":[...]\n{"edges":[...]}`), merge multiple top-level JSON objects; imported by `llm.py` as `_parse_llm_json` | Yes — parser robustness for local models |
+| **Skip `reasoning_effort` for Gemma** | `graphify/llm.py` → `_call_openai_compat`, `_supports_reasoning_effort` | Gemma via `--backend gemini` rejects OpenAI-style thinking level; do not send `reasoning_effort` from `BACKENDS["gemini"]` | Yes — bugfix (#1326 note; still broken on upstream v8 extract path) |
+| **Strip Gemma `<thought>` preamble** | `graphify/llm_json_parser.py` | Parse JSON after thinking blocks | Yes — parser robustness |
+| **Manifest path alias on extract** | `graphify/__main__.py` → `_manifest_files` | Stamp semantic_hash using `path_covered_by_extraction` (detect uses absolute paths; LLM `source_file` is relative) | Yes — empty `{}` manifest bug |
 | **Debug prints** | `graphify/llm.py` → `_response_is_hollow()` | `[RAW CONTENT IS NULL]`, `[PARSED IS EMPTY]` | **Remove** before commit |
 
 **New module:** `graphify/llm_json_parser.py` — keep parser logic here (not inline in `llm.py`) so upstream merges on `llm.py` do not clobber recovery. Tests: `tests/test_llm_parser.py` imports `parse_llm_json` directly.
@@ -109,8 +175,8 @@ git merge upstream/v8
 After merge:
 
 1. **Resolve conflicts** using the table above — never drop `file_slice.py`, `stitch.py`, incremental guards without re-applying.
-2. **Re-apply section B** if merge overwrote `_extraction_system`, `_response_is_hollow`, or dropped `llm_json_parser.py`.
-3. **Run tests:** `pytest tests/test_file_slice.py tests/test_stitch.py tests/test_build.py tests/test_chunking.py tests/test_llm_parser.py -q`
+2. **Re-apply section B** if merge overwrote `_extraction_system`, `_response_is_hollow`, `_call_openai_compat` reasoning guard, or dropped `llm_json_parser.py`.
+3. **Run tests:** `pytest tests/test_file_slice.py tests/test_stitch.py tests/test_build.py tests/test_chunking.py tests/test_llm_parser.py tests/test_llm_backends.py -q`
 4. **Reinstall:** `graphify-test/rebuild-graphify.sh`
 5. **Smoke:** `graphify-test/run-smoke-ollama.sh` + `analyze-traceability.py`
 
@@ -119,7 +185,7 @@ After merge:
 | File | Keep from |
 |------|-----------|
 | `file_slice.py`, `stitch.py` | **ours** (fork) unless upstream added equivalent |
-| `llm.py` OpenRouter / `BACKENDS` | **theirs** (upstream v8) + re-apply suffix + hollow fix + `from graphify.llm_json_parser import parse_llm_json` |
+| `llm.py` OpenRouter / `BACKENDS` | **theirs** (upstream v8) + re-apply suffix + hollow fix + Gemma `reasoning_effort` guard + `from graphify.llm_json_parser import parse_llm_json` |
 | `llm_json_parser.py` | **ours** (fork) — new file; safe unless upstream adds equivalent |
 | `__main__.py`, `build.py` incremental | **ours** + integrate upstream CLI flags |
 | `skill*.md`, skillgen | usually **theirs**, re-run skillgen if needed |
@@ -148,7 +214,15 @@ Keeps `feat/incremental-stitch-file-slice` as the PR branch and `maintain/v8-*` 
 
 ## PR status
 
-[#1326](https://github.com/safishamsi/graphify/pull/1326) — intra-file slice, incremental safety, stitch. If closed unmerged, **keep the fork branch**; upstream may implement subsets later — use this doc + `git log upstream/v8..HEAD` to see what still differs.
+[#1326](https://github.com/safishamsi/graphify/pull/1326) — closed; work split into three upstream PRs:
+
+| Part | Branch | Upstream PR |
+|------|--------|-------------|
+| 1 — file slice | `feat/file-slice` | [#1369](https://github.com/safishamsi/graphify/pull/1369) |
+| 2 — incremental safety | `feat/incremental-safety` | [#1370](https://github.com/safishamsi/graphify/pull/1370) |
+| 3 — cross-file stitch | `feat/cross-file-stitch` (stacked on #1370) | [#1371](https://github.com/safishamsi/graphify/pull/1371) |
+
+Merge order: **#1369** (independent) → **#1370** → **#1371**.
 
 Quick diff after each sync:
 
@@ -168,5 +242,7 @@ git diff upstream/v8...HEAD --stat
 | 2026-06-16 | `GRAPHIFY_EXTRACTION_SUFFIX` + hollow `finish_reason=stop` (local `llm.py`) |
 | 2026-06-16 | `llm_json_parser.py` — split JSON heal/merge for Ollama Gemma |
 | 2026-06-16 | Smoke: `gemma4:4E`, 16k ctx, DOCUMENT-ONLY suffix; 41-node corpus graph |
+| 2026-06-18 | Split #1326 → upstream PRs #1369 / #1370 / #1371 |
+| 2026-06-18 | Fork: strip Gemma `<thought>` in `llm_json_parser.py`; knowhow uses clustered extract |
 
 Update this table when committing fork patches or completing an upstream merge.

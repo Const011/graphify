@@ -108,6 +108,26 @@ def test_split_envelope_missing_closing_brace_is_healed():
     assert len(result["edges"]) == 1
 
 
+def test_thought_block_before_json_is_stripped():
+    """Gemma may prefix valid JSON with a <thought> reasoning block."""
+    raw = (
+        "<thought>Plan: extract billing concepts from doc.md only.</thought>\n"
+        '{"nodes": [{"id": "billing", "label": "Billing"}], "edges": []}'
+    )
+    result = parse_llm_json(raw)
+    assert result["nodes"] == [{"id": "billing", "label": "Billing"}]
+
+
+def test_unclosed_thought_prefix_before_json_is_stripped():
+    """When Gemma omits </thought>, keep text from the first JSON object."""
+    raw = (
+        "<thought>Input: doc.md with billing prose.\n"
+        '{"nodes": [{"id": "billing", "label": "Billing workflow"}], "edges": []}'
+    )
+    result = parse_llm_json(raw)
+    assert len(result["nodes"]) == 1
+
+
 # ---------- _call_claude_cli: argv shape ----------
 
 

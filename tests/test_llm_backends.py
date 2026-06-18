@@ -461,6 +461,41 @@ def test_non_ollama_backend_gets_no_num_ctx_extra_body(monkeypatch):
     assert eb is None or "options" not in eb, "non-ollama backends must not get num_ctx injection"
 
 
+def test_call_openai_compat_skips_reasoning_effort_for_gemma(monkeypatch):
+    """Google Gemma models reject OpenAI-style reasoning_effort (400 thinking level)."""
+    captured = _install_capturing_openai(monkeypatch)
+
+    llm._call_openai_compat(
+        "https://generativelanguage.googleapis.com/v1beta/openai/",
+        "key",
+        "gemma-4-31b-it",
+        "u",
+        temperature=0,
+        reasoning_effort="low",
+        max_completion_tokens=8192,
+        backend="gemini",
+    )
+
+    assert "reasoning_effort" not in captured
+
+
+def test_call_openai_compat_sends_reasoning_effort_for_gemini_flash(monkeypatch):
+    captured = _install_capturing_openai(monkeypatch)
+
+    llm._call_openai_compat(
+        "https://generativelanguage.googleapis.com/v1beta/openai/",
+        "key",
+        "gemini-3-flash-preview",
+        "u",
+        temperature=0,
+        reasoning_effort="low",
+        max_completion_tokens=8192,
+        backend="gemini",
+    )
+
+    assert captured.get("reasoning_effort") == "low"
+
+
 # ---------------------------------------------------------------------------
 # Custom-provider extra_body: lets providers.json route around the moonshot-only
 # default. Self-hosted Qwen3 served by vLLM needs

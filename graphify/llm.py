@@ -924,7 +924,7 @@ def _call_openai_compat(
     }
     if temperature is not None:
         kwargs["temperature"] = temperature
-    if reasoning_effort is not None:
+    if reasoning_effort is not None and _supports_reasoning_effort(model):
         kwargs["reasoning_effort"] = reasoning_effort
     # A custom provider in providers.json can pass its own extra_body (e.g.
     # `chat_template_kwargs.enable_thinking=false` for self-hosted Qwen3 served

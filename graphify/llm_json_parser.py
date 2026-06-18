@@ -20,6 +20,20 @@ _SPLIT_ENVELOPE_RE = re.compile(
     r"(\])\s*(\{\s*\"(?:edges|hyperedges)\"\s*:)",
     re.DOTALL,
 )
+# Gemma via Google OpenAI-compat sometimes prefixes JSON with a <thought> block.
+_THOUGHT_BLOCK_RE = re.compile(r"<thought>.*?</thought>", re.IGNORECASE | re.DOTALL)
+
+
+def strip_model_thought_blocks(text: str) -> str:
+    """Remove model thinking preamble (Gemma ``<thought>…</thought>``) before JSON parse."""
+    cleaned = _THOUGHT_BLOCK_RE.sub("", text)
+    stripped = cleaned.lstrip()
+    if stripped.lower().startswith("<thought"):
+        brace = cleaned.find("{")
+        if brace != -1:
+            return cleaned[brace:].lstrip()
+        return ""
+    return cleaned.strip()
 
 
 def heal_split_json_envelope(text: str) -> str:
@@ -128,7 +142,7 @@ def parse_llm_json(raw: str) -> dict:
             file=sys.stderr,
         )
         return dict(_EMPTY_FRAGMENT)
-    stripped = _strip_markdown_fences(raw)
+    stripped = strip_model_thought_blocks(_strip_markdown_fences(raw))
     healed = heal_split_json_envelope(stripped)
     for candidate in (stripped, healed):
         try:

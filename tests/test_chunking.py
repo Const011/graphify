@@ -409,7 +409,6 @@ def test_adaptive_retry_single_file_truncation_does_not_recurse(tmp_path, capsys
     with patch("graphify.llm.extract_files_direct", side_effect=stub):
         _extract_with_adaptive_retry(
             [f], backend="kimi", api_key=None, model=None, root=tmp_path, max_depth=3,
-            token_budget=1_000,
         )
 
     assert calls == [1], f"single-file chunk recursed; calls = {calls}"
@@ -425,7 +424,7 @@ def test_adaptive_retry_splits_oversized_markdown_on_truncation(tmp_path):
     doc = tmp_path / "big.md"
     text = "line\n" * 200
     doc.write_text(text)
-    whole = FileSlice(path=doc, start_char=0, end_char=len(text))
+    whole = FileSlice(path=doc, start=0, end=len(text), index=0, total=1)
 
     calls = []
 
@@ -442,7 +441,6 @@ def test_adaptive_retry_splits_oversized_markdown_on_truncation(tmp_path):
             model=None,
             root=tmp_path,
             max_depth=3,
-            token_budget=2_000,
         )
 
     assert len(calls) > 1

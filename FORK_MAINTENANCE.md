@@ -106,10 +106,10 @@ Core fork features (merge carefully; upstream may add overlapping fixes):
 
 | Area | Files | What |
 |------|-------|------|
-| **Intra-file slicing** | `graphify/file_slice.py`, `graphify/llm.py`, `tests/test_file_slice.py` | Split large `.md`/`.txt`/`.rst` by headings; adaptive bisect on truncation; `SemanticUnit` / `FileSlice` |
+| **Intra-file slicing** | `graphify/file_slice.py`, `graphify/llm.py`, `tests/test_file_slice.py` | **Upstream #1369 (v8 @ 0.8.43):** split oversized `.md`/`.txt`/`.rst` at heading/paragraph boundaries by `_FILE_CHAR_CAP` (20k chars) **before** packing — full file coverage, no silent tail drop. Adaptive retry bisects `FileSlice` units on truncation. |
 | **Incremental safety** | `graphify/__main__.py`, `graphify/build.py`, `tests/test_build.py`, `tests/test_extract.py` | Abort incremental extract on failed/empty re-extract; safe prune; no silent graph shrink |
 | **Cross-file stitch** | `graphify/stitch.py`, `tests/test_stitch.py` | Post-merge `references` edges from changed docs → existing graph (backticks + paths); `new_node_ids` for wrong LLM `source_file` |
-| **LLM wiring** | `graphify/llm.py` | `_read_files(units)`, slice labels in prompt, `split_chunk_for_retry` from `file_slice` |
+| **LLM wiring** | `graphify/llm.py` | `_read_files(units)` — slices use `read_slice_text`; whole files still capped at `_FILE_CHAR_CAP`; `extract_corpus_parallel` calls `expand_oversized_files(files, _FILE_CHAR_CAP)` first (#1369) |
 | **Docs / version** | `CHANGELOG.md`, `README.md`, `pyproject.toml` | PR description material |
 
 **Note:** Early PR commits added OpenRouter/`GOOGLE_BYOK` in `llm.py`. Upstream **v8** later shipped `#1273` (custom `OPENAI_BASE_URL` / env keys). On merge, prefer **upstream** OpenAI config; keep slice/stitch/incremental logic from our branch.
@@ -221,7 +221,7 @@ After merge:
 
 | File | Keep from |
 |------|-----------|
-| `file_slice.py`, `stitch.py` | **ours** (fork) unless upstream added equivalent |
+| `file_slice.py`, `stitch.py` | **theirs** (upstream #1369 slicing merged 2026-06-19) unless fork adds stitch-only deltas |
 | `llm.py` OpenRouter / `BACKENDS` | **theirs** (upstream v8) + re-apply suffix + hollow fix + Gemma `reasoning_effort` guard + **single** `from graphify.llm_json_parser import parse_llm_json as _parse_llm_json` (no local duplicate) |
 | `llm_json_parser.py` | **ours** (fork) — new file; safe unless upstream adds equivalent |
 | `__main__.py` `_manifest_files` | **ours** — `path_covered_by_extraction` manifest stamp (PR #1) |
@@ -284,6 +284,6 @@ git diff upstream/v8...HEAD --stat
 | 2026-06-18 | Knowhow: clustered extract; `links`/`edges` graph counts; incremental gate matches graphify |
 | 2026-06-18 | Fork: manifest stamp via `path_covered_by_extraction` (`__main__.py`) — **upstream PR #1 candidate** |
 | 2026-06-18 | Fork: `llm_json_parser` `<thought>` strip + remove shadow `_parse_llm_json` in `llm.py` — **upstream PR #2 candidate** |
-| 2026-06-18 | Fork: incremental `prune_sources` = deleted files only (`__main__.py`) |
+| 2026-06-19 | Merged `upstream/v8` @ 0.8.43 — upstream #1369 file slicing replaces fork token-estimate/`char_cap` slice path; fork patches retained in `llm.py` (`llm_json_parser`, `GRAPHIFY_EXTRACTION_SUFFIX`, Gemma `reasoning_effort`, intentional-empty hollow guard) |
 
 Update this table when committing fork patches or completing an upstream merge.

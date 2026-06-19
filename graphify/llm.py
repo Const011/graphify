@@ -18,13 +18,9 @@ from pathlib import Path
 
 from graphify.file_slice import (
     FileSlice,
-    SemanticUnit,
+    bisect_slice,
     expand_oversized_files,
-    estimate_unit_tokens,
-    is_file_slice,
-    read_unit_text,
-    split_chunk_for_retry,
-    unit_label,
+    read_slice_text,
     unit_path,
 )
 from graphify.llm_json_parser import parse_llm_json as _parse_llm_json
@@ -96,7 +92,7 @@ BACKENDS: dict[str, dict] = {
     "gemini": {
         "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
         "default_model": "gemini-3-flash-preview",
-        "env_keys": ["GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_BYOK"],
+        "env_keys": ["GEMINI_API_KEY", "GOOGLE_API_KEY"],
         "model_env_key": "GRAPHIFY_GEMINI_MODEL",
         "pricing": {"input": 0.50, "output": 3.00},  # USD per 1M tokens
         "temperature": 0,
@@ -472,34 +468,34 @@ def _wrap_untrusted(rel: str, content: str) -> str:
     )
 
 
-def _read_files(units: list[SemanticUnit], root: Path) -> str:
-    """Return file contents formatted for the extraction prompt.
+def _read_files(units: "list[Path | FileSlice]", root: Path) -> str:
+    """Return file/slice contents formatted for the extraction prompt.
 
-    Each file is wrapped in an <untrusted_source> delimiter block and known
+    Each unit is wrapped in an <untrusted_source> delimiter block and known
     injection sentinels are defanged, so attacker-controlled source text cannot
     be confused with the trusted system instructions (see issue #1210).
+
+    A ``FileSlice`` (one chunk of an oversized document, #1369) reports its
+    **parent file path** as ``rel`` so every slice of a file shares one
+    source_file and the graph isn't fragmented per-slice.
     """
     parts: list[str] = []
-    for unit in units:
-        p = unit_path(unit)
+    for u in units:
+        p = unit_path(u)
         try:
             rel = str(p.relative_to(root))
         except ValueError:
             rel = str(p)
         try:
-            if is_file_slice(unit):
-                content = read_unit_text(unit)
-                sl = unit.source_location()
-                content = (
-                    f"[graphify slice {unit.slice_index + 1}/{unit.slice_count}, {sl}]\n"
-                    + content
-                )
+            if isinstance(u, FileSlice):
+                content = read_slice_text(u)
             else:
                 content = _file_to_text(p)
-                content = content[:_FILE_CHAR_CAP]
         except OSError:
             continue
-        parts.append(_wrap_untrusted(rel, content))
+        # Whole files are still capped (covers non-splittable large files like
+        # code); slices are already bounded to the cap, so the cap is a no-op.
+        parts.append(_wrap_untrusted(rel, content[:_FILE_CHAR_CAP]))
     return "\n\n".join(parts)
 
 
@@ -568,17 +564,15 @@ def _is_vision_image(path: Path) -> bool:
 
 
 def _partition_semantic_files(
-    units: list[SemanticUnit],
-) -> tuple[list[SemanticUnit], list[Path]]:
-    """Split a chunk into (text-like units, raster-image files)."""
-    text_units: list[SemanticUnit] = []
-    image_files: list[Path] = []
-    for unit in units:
-        p = unit_path(unit)
-        if _is_vision_image(p):
-            image_files.append(p)
-        else:
-            text_units.append(unit)
+    units: "list[Path | FileSlice]",
+) -> tuple["list[Path | FileSlice]", list[Path]]:
+    """Split a chunk into (text-like units, raster-image files).
+
+    A ``FileSlice`` is always text (only splittable text is sliced), so it never
+    lands in the image partition.
+    """
+    text_units = [u for u in units if isinstance(u, FileSlice) or not _is_vision_image(u)]
+    image_files = [u for u in units if not isinstance(u, FileSlice) and _is_vision_image(u)]
     return text_units, image_files
 
 
@@ -724,6 +718,25 @@ def _bedrock_content(user_message: str, refs: list[_ImageRef]) -> list[dict]:
     return content
 
 
+def _is_intentional_empty_extraction(raw_content: str, parsed: dict) -> bool:
+    """True when the model deliberately returned an empty graph fragment."""
+    if parsed.get("finish_reason") != "stop":
+        return False
+    nodes = parsed.get("nodes")
+    edges = parsed.get("edges")
+    hyperedges = parsed.get("hyperedges")
+    if nodes or edges or hyperedges:
+        return False
+    stripped = (raw_content or "").strip()
+    if not stripped.startswith("{"):
+        return False
+    try:
+        obj = json.loads(stripped)
+    except json.JSONDecodeError:
+        return False
+    return isinstance(obj, dict)
+
+
 def _response_is_hollow(raw_content: str | None, parsed: dict) -> bool:
     """Detect a successful HTTP response that yielded no usable extraction.
 
@@ -735,14 +748,20 @@ def _response_is_hollow(raw_content: str | None, parsed: dict) -> bool:
     `finish_reason` is `"stop"` rather than `"length"`. By flagging the
     result as hollow, callers can re-route it through the same bisection
     path used for context-window overflow and `finish_reason="length"`.
+
+    Intentional empty JSON (``{"nodes":[],"edges":[]}`` with ``finish_reason=stop``)
+    is valid for code-only or fenced-code slices — do not treat as hollow.
     """
     if raw_content is None or not raw_content.strip():
         return True
     nodes = parsed.get("nodes")
     edges = parsed.get("edges")
     hyperedges = parsed.get("hyperedges")
-    finish_reason = parsed.get("finish_reason")
-    return not nodes and not edges and not hyperedges and finish_reason != "stop"
+    if nodes or edges or hyperedges:
+        return False
+    if _is_intentional_empty_extraction(raw_content, parsed):
+        return False
+    return True
 
 
 def _backend_env_keys(backend: str) -> list[str]:
@@ -1226,7 +1245,7 @@ def _call_bedrock(model: str, user_message: str, max_tokens: int = 8192, *, deep
 
 
 def extract_files_direct(
-    files: list[SemanticUnit],
+    files: list[Path],
     backend: str | None = None,
     api_key: str | None = None,
     model: str | None = None,
@@ -1239,7 +1258,12 @@ def extract_files_direct(
     Returns dict with nodes, edges, hyperedges, input_tokens, output_tokens.
     Raises ValueError for unknown backends or when no API key is configured.
     Raises ImportError if SDK missing.
+
+    Accepts ``str`` paths as well as ``Path``; string entries are coerced up
+    front so downstream helpers (``_partition_semantic_files``, ``_read_files``,
+    ``_build_image_refs``) can rely on ``Path`` semantics (#1386).
     """
+    files = [Path(f) for f in files]
     if backend is None:
         backend = detect_backend()
         if backend is None:
@@ -1330,46 +1354,75 @@ def extract_files_direct(
     )
 
 
-def _estimate_file_tokens(path: Path) -> int:
-    """Estimate the prompt-token cost of a single file under `_read_files` rules."""
-    return estimate_unit_tokens(path, tokenizer=_TOKENIZER, char_cap=_FILE_CHAR_CAP)
+def _estimate_file_tokens(unit: "Path | FileSlice") -> int:
+    """Estimate the prompt-token cost of a file or slice under `_read_files` rules.
 
+    Uses tiktoken (`cl100k_base`) when available for accurate counts. Falls back
+    to the chars/4 heuristic if tiktoken is not installed. Both paths cap at
+    `_FILE_CHAR_CAP` to match `_read_files`'s truncation, plus a constant for
+    the wrapper. Returns 0 for unreadable paths so they don't blow up packing.
+    """
+    if isinstance(unit, FileSlice):
+        # A slice's size is its char range (already ≤ _FILE_CHAR_CAP). Use the
+        # tokenizer on its text when available, else the chars/4 heuristic.
+        if _TOKENIZER is None:
+            return (min(unit.end - unit.start, _FILE_CHAR_CAP) + _PER_FILE_OVERHEAD_CHARS) // _CHARS_PER_TOKEN
+        try:
+            content = read_slice_text(unit)[:_FILE_CHAR_CAP]
+        except OSError:
+            return 0
+        return len(_TOKENIZER.encode(content)) + (_PER_FILE_OVERHEAD_CHARS // _CHARS_PER_TOKEN)
 
-def _estimate_unit_tokens(unit: SemanticUnit) -> int:
-    if _is_vision_image(unit_path(unit)):
+    path = unit
+    # Raster images are not read as text; a vision model bills them at a roughly
+    # fixed token cost, so estimate by image count rather than (binary) byte size.
+    if _is_vision_image(path):
         return _IMAGE_TOKEN_ESTIMATE
-    return estimate_unit_tokens(unit, tokenizer=_TOKENIZER, char_cap=_FILE_CHAR_CAP)
+    if _TOKENIZER is None:
+        try:
+            size = path.stat().st_size
+        except OSError:
+            return 0
+        chars = min(size, _FILE_CHAR_CAP) + _PER_FILE_OVERHEAD_CHARS
+        return chars // _CHARS_PER_TOKEN
+
+    try:
+        content = path.read_text(encoding="utf-8", errors="replace")[:_FILE_CHAR_CAP]
+    except OSError:
+        return 0
+    return len(_TOKENIZER.encode(content)) + (_PER_FILE_OVERHEAD_CHARS // _CHARS_PER_TOKEN)
 
 
 def _pack_chunks_by_tokens(
-    units: list[SemanticUnit],
+    files: "list[Path | FileSlice]",
     token_budget: int,
-) -> list[list[SemanticUnit]]:
-    """Greedily pack files into chunks that fit a token budget.
+) -> "list[list[Path | FileSlice]]":
+    """Greedily pack files/slices into chunks that fit a token budget.
 
-    Files are first grouped by parent directory so related artifacts share a
+    Units are first grouped by parent directory so related artifacts share a
     chunk (cross-file edges are more likely to be extracted within a chunk
-    than across chunks). Within each directory, files are added one at a
-    time; a chunk is closed when adding the next file would exceed the
-    budget. Oversized splittable text files should already be expanded into
-    :class:`~graphify.file_slice.FileSlice` units before packing.
+    than across chunks). Within each directory, units are added one at a
+    time; a chunk is closed when adding the next would exceed the budget.
+    Oversized splittable documents are pre-split into ``FileSlice`` units by
+    ``expand_oversized_files`` before packing (#1369), so the old "one file
+    larger than the budget" case no longer silently drops content.
     """
     if token_budget <= 0:
         raise ValueError(f"token_budget must be positive, got {token_budget}")
 
-    by_dir: dict[Path, list[SemanticUnit]] = {}
-    for unit in units:
-        by_dir.setdefault(unit_path(unit).parent, []).append(unit)
+    by_dir: dict[Path, "list[Path | FileSlice]"] = {}
+    for f in files:
+        by_dir.setdefault(unit_path(f).parent, []).append(f)
 
-    chunks: list[list[SemanticUnit]] = []
-    current: list[SemanticUnit] = []
+    chunks: "list[list[Path | FileSlice]]" = []
+    current: "list[Path | FileSlice]" = []
     current_tokens = 0
     current_images = 0
 
     for directory in sorted(by_dir):
         for unit in by_dir[directory]:
-            cost = _estimate_unit_tokens(unit)
-            is_image = _is_vision_image(unit_path(unit))
+            cost = _estimate_file_tokens(unit)
+            is_image = not isinstance(unit, FileSlice) and _is_vision_image(unit)
             over_budget = current_tokens + cost > token_budget
             over_images = is_image and current_images >= _MAX_IMAGES_PER_CHUNK
             if current and (over_budget or over_images):
@@ -1415,25 +1468,8 @@ def _looks_like_context_exceeded(exc: BaseException) -> bool:
     return any(marker in msg for marker in _CONTEXT_EXCEEDED_MARKERS)
 
 
-def _merge_extraction_results(
-    left: dict,
-    right: dict,
-    *,
-    model: str | None = None,
-) -> dict:
-    return {
-        "nodes": left.get("nodes", []) + right.get("nodes", []),
-        "edges": left.get("edges", []) + right.get("edges", []),
-        "hyperedges": left.get("hyperedges", []) + right.get("hyperedges", []),
-        "input_tokens": left.get("input_tokens", 0) + right.get("input_tokens", 0),
-        "output_tokens": left.get("output_tokens", 0) + right.get("output_tokens", 0),
-        "model": model or right.get("model") or left.get("model"),
-        "finish_reason": "stop",
-    }
-
-
 def _extract_with_adaptive_retry(
-    chunk: list[SemanticUnit],
+    chunk: list[Path],
     backend: str,
     api_key: str | None,
     model: str | None,
@@ -1442,7 +1478,6 @@ def _extract_with_adaptive_retry(
     _depth: int = 0,
     *,
     deep_mode: bool = False,
-    token_budget: int | None = None,
 ) -> dict:
     """Extract a chunk; if the response is truncated (`finish_reason="length"`)
     or the API rejects the prompt as too large for the model's context window,
@@ -1472,33 +1507,34 @@ def _extract_with_adaptive_retry(
     still failing at the cap, we surface the (likely empty) result with a
     warning rather than infinite-loop.
 
-    A single-file chunk that overflows may still be recoverable when the unit
-    is splittable text (``.md``, ``.txt``, etc.) — we bisect the file or slice
-    and recurse. Non-splittable single files (e.g. one huge ``.py``) cannot be
-    shrunk further; we return what we got and warn.
+    A single-file chunk that overflows is recoverable only when it's a slice of
+    a splittable document: the slice is bisected and retried (#1369). A whole
+    non-splittable file (e.g. one huge code file) can't be made smaller than
+    itself, so we return what we got and warn.
     """
-    def _retry_halves() -> dict:
-        sub_chunks = split_chunk_for_retry(chunk, token_budget, tokenizer=_TOKENIZER)
-        if sub_chunks is None:
-            return {}
-        results = [
-            _extract_with_adaptive_retry(
-                sub,
-                backend,
-                api_key,
-                model,
-                root,
-                max_depth,
-                _depth + 1,
-                deep_mode=deep_mode,
-                token_budget=token_budget,
-            )
-            for sub in sub_chunks
-        ]
-        merged = results[0]
-        for part in results[1:]:
-            merged = _merge_extraction_results(merged, part, model=model)
-        return merged
+    def _merge_two(left_units, right_units) -> dict:
+        left = _extract_with_adaptive_retry(
+            left_units, backend, api_key, model, root, max_depth, _depth + 1, deep_mode=deep_mode
+        )
+        right = _extract_with_adaptive_retry(
+            right_units, backend, api_key, model, root, max_depth, _depth + 1, deep_mode=deep_mode
+        )
+        return {
+            "nodes": left.get("nodes", []) + right.get("nodes", []),
+            "edges": left.get("edges", []) + right.get("edges", []),
+            "hyperedges": left.get("hyperedges", []) + right.get("hyperedges", []),
+            "input_tokens": left.get("input_tokens", 0) + right.get("input_tokens", 0),
+            "output_tokens": left.get("output_tokens", 0) + right.get("output_tokens", 0),
+            "model": model,
+            "finish_reason": "stop",
+        }
+
+    def _split_lone_slice() -> "tuple[FileSlice, FileSlice] | None":
+        # When a single-unit chunk is a slice, bisect the slice so we can retry
+        # on a smaller range rather than give up (#1369).
+        if len(chunk) == 1 and isinstance(chunk[0], FileSlice) and _depth < max_depth:
+            return bisect_slice(chunk[0])
+        return None
 
     try:
         result = extract_files_direct(
@@ -1507,6 +1543,21 @@ def _extract_with_adaptive_retry(
     except Exception as exc:  # noqa: BLE001 — re-raise unless it's a known context overflow
         if not _looks_like_context_exceeded(exc):
             raise
+        if len(chunk) <= 1:
+            halves = _split_lone_slice()
+            if halves is not None:
+                print(
+                    f"[graphify] slice of {unit_path(chunk[0])} exceeded context at "
+                    f"depth {_depth}; splitting the slice and retrying",
+                    file=sys.stderr,
+                )
+                return _merge_two([halves[0]], [halves[1]])
+            print(
+                f"[graphify] single-file chunk {unit_path(chunk[0])} exceeds model context "
+                f"and cannot be split further: {exc}",
+                file=sys.stderr,
+            )
+            return {"nodes": [], "edges": [], "hyperedges": [], "input_tokens": 0, "output_tokens": 0, "model": model, "finish_reason": "stop"}
         if _depth >= max_depth:
             print(
                 f"[graphify] chunk of {len(chunk)} still overflows context at "
@@ -1514,22 +1565,45 @@ def _extract_with_adaptive_retry(
                 file=sys.stderr,
             )
             return {"nodes": [], "edges": [], "hyperedges": [], "input_tokens": 0, "output_tokens": 0, "model": model, "finish_reason": "stop"}
-        sub = split_chunk_for_retry(chunk, token_budget, tokenizer=_TOKENIZER)
-        if sub is None:
-            print(
-                f"[graphify] single-file chunk {unit_label(chunk[0])} exceeds model context "
-                f"and cannot be split further: {exc}",
-                file=sys.stderr,
-            )
-            return {"nodes": [], "edges": [], "hyperedges": [], "input_tokens": 0, "output_tokens": 0, "model": model, "finish_reason": "stop"}
         print(
             f"[graphify] chunk of {len(chunk)} exceeded context at depth "
-            f"{_depth} ({type(exc).__name__}); splitting and retrying",
+            f"{_depth} ({type(exc).__name__}); splitting in half and retrying",
             file=sys.stderr,
         )
-        return _retry_halves()
+        mid = len(chunk) // 2
+        left = _extract_with_adaptive_retry(
+            chunk[:mid], backend, api_key, model, root, max_depth, _depth + 1, deep_mode=deep_mode
+        )
+        right = _extract_with_adaptive_retry(
+            chunk[mid:], backend, api_key, model, root, max_depth, _depth + 1, deep_mode=deep_mode
+        )
+        return {
+            "nodes": left.get("nodes", []) + right.get("nodes", []),
+            "edges": left.get("edges", []) + right.get("edges", []),
+            "hyperedges": left.get("hyperedges", []) + right.get("hyperedges", []),
+            "input_tokens": left.get("input_tokens", 0) + right.get("input_tokens", 0),
+            "output_tokens": left.get("output_tokens", 0) + right.get("output_tokens", 0),
+            "model": model,
+            "finish_reason": "stop",
+        }
 
     if result.get("finish_reason") != "length":
+        return result
+
+    if len(chunk) <= 1:
+        halves = _split_lone_slice()
+        if halves is not None:
+            print(
+                f"[graphify] slice of {unit_path(chunk[0])} truncated at depth {_depth}; "
+                f"splitting the slice and retrying",
+                file=sys.stderr,
+            )
+            return _merge_two([halves[0]], [halves[1]])
+        print(
+            f"[graphify] single-file chunk {unit_path(chunk[0])} truncated at "
+            f"max_completion_tokens — partial result kept",
+            file=sys.stderr,
+        )
         return result
 
     if _depth >= max_depth:
@@ -1540,24 +1614,32 @@ def _extract_with_adaptive_retry(
         )
         return result
 
-    sub = split_chunk_for_retry(chunk, token_budget, tokenizer=_TOKENIZER)
-    if sub is None:
-        print(
-            f"[graphify] single-file chunk {unit_label(chunk[0])} truncated at "
-            f"max_completion_tokens — partial result kept",
-            file=sys.stderr,
-        )
-        return result
-
     print(
         f"[graphify] chunk of {len(chunk)} truncated at depth {_depth}, "
-        f"splitting into {len(sub)} sub-chunk(s) and retrying",
+        f"splitting into halves of {len(chunk) // 2} and "
+        f"{len(chunk) - len(chunk) // 2}",
         file=sys.stderr,
     )
-    retried = _retry_halves()
-    if retried:
-        return retried
-    return result
+    mid = len(chunk) // 2
+    left = _extract_with_adaptive_retry(
+        chunk[:mid], backend, api_key, model, root, max_depth, _depth + 1, deep_mode=deep_mode
+    )
+    right = _extract_with_adaptive_retry(
+        chunk[mid:], backend, api_key, model, root, max_depth, _depth + 1, deep_mode=deep_mode
+    )
+
+    return {
+        "nodes": left.get("nodes", []) + right.get("nodes", []),
+        "edges": left.get("edges", []) + right.get("edges", []),
+        "hyperedges": left.get("hyperedges", []) + right.get("hyperedges", []),
+        "input_tokens": left.get("input_tokens", 0) + right.get("input_tokens", 0),
+        "output_tokens": left.get("output_tokens", 0) + right.get("output_tokens", 0),
+        "model": result.get("model"),
+        # Both halves either succeeded or have already surfaced their own
+        # truncation warning; the merged result is no longer truncated as a
+        # logical unit.
+        "finish_reason": "stop",
+    }
 
 
 def extract_corpus_parallel(
@@ -1606,15 +1688,17 @@ def extract_corpus_parallel(
     Returns merged dict with nodes, edges, hyperedges, input_tokens,
     output_tokens. Failed chunks are logged to stderr and skipped — one bad
     chunk does not abort the run.
+
+    Accepts ``str`` paths as well as ``Path``; string entries are coerced up
+    front so packing/slicing helpers can rely on ``Path`` semantics (#1386).
     """
+    files = [Path(f) for f in files]
+    # Split oversized splittable documents into slices that cover the whole file
+    # before packing, so content past _FILE_CHAR_CAP is extracted instead of
+    # silently dropped (#1369). Files at/under the cap pass through unchanged.
+    files = expand_oversized_files(files, _FILE_CHAR_CAP)
     if token_budget is not None:
-        units = expand_oversized_files(
-            files,
-            token_budget,
-            tokenizer=_TOKENIZER,
-            char_cap=_FILE_CHAR_CAP,
-        )
-        chunks = _pack_chunks_by_tokens(units, token_budget=token_budget)
+        chunks = _pack_chunks_by_tokens(files, token_budget=token_budget)
     else:
         chunks = [files[i:i + chunk_size] for i in range(0, len(files), chunk_size)]
 
@@ -1625,7 +1709,7 @@ def extract_corpus_parallel(
     }
     total = len(chunks)
 
-    def _run_one(idx: int, chunk: list[SemanticUnit]) -> tuple[int, dict | None, Exception | None]:
+    def _run_one(idx: int, chunk: list[Path]) -> tuple[int, dict | None, Exception | None]:
         t0 = time.time()
         try:
             result = _extract_with_adaptive_retry(
@@ -1636,7 +1720,6 @@ def extract_corpus_parallel(
                 root=root,
                 max_depth=max_retry_depth,
                 deep_mode=deep_mode,
-                token_budget=token_budget,
             )
             result["elapsed_seconds"] = round(time.time() - t0, 2)
             return idx, result, None
@@ -2025,6 +2108,69 @@ def _parse_label_response(text: str, labeled_cids: list[int]) -> dict[int, str]:
     return out
 
 
+def _label_batch_with_retry(
+    batch_cids: list[int],
+    batch_lines: list[str],
+    *,
+    backend: str,
+    model: str | None,
+    depth: int = 0,
+    max_depth: int = 3,
+) -> dict[int, str]:
+    """Label a batch of communities, splitting in half and retrying on parse failure.
+
+    Mirrors `_extract_with_adaptive_retry`'s recovery shape for the labeling path
+    (#1278). When the LLM returns malformed JSON or a non-object payload, the
+    batch is split at the midpoint and each half is retried recursively. Recursion
+    is capped at ``max_depth`` to bound cost.
+
+    Returns ``{cid: name}`` for everything that could be labeled. When a batch
+    can't be split further (a single community, or ``depth >= max_depth``) and
+    still won't parse, the parse error is **re-raised**: ``label_communities``
+    catches it per batch and skips that batch (its communities stay unlabeled),
+    re-raising only if every batch fails. Any non-parse exception (network,
+    missing config, programming bug) propagates unchanged — those are never
+    split-retried.
+    """
+    prompt = (
+        "You are naming clusters in a knowledge graph. For each community below, "
+        "return a concise 2-5 word plain-language name describing what it is about "
+        "(e.g. \"Order Management\", \"Payment Flow\", \"Auth Middleware\"). "
+        "Respond ONLY with a JSON object mapping the community id (as a string) to "
+        "its name - no prose, no markdown fences.\n\n" + "\n".join(batch_lines)
+    )
+    max_tokens = _resolve_max_tokens(min(64 + 24 * len(batch_cids), 8192))
+    call_kwargs: dict = {"backend": backend, "max_tokens": max_tokens}
+    if model is not None:
+        call_kwargs["model"] = model
+
+    try:
+        text = _call_llm(prompt, **call_kwargs)
+        return _parse_label_response(text, batch_cids)
+    except (json.JSONDecodeError, ValueError) as exc:
+        # Parse failure. If we can still split, retry each half on a smaller
+        # prompt (smaller output → less likely to truncate/mangle). At the base
+        # case (single community or max depth) re-raise so the caller skips it.
+        if len(batch_cids) <= 1 or depth >= max_depth:
+            print(
+                f"[graphify label] batch of {len(batch_cids)} still unparseable "
+                f"at depth {depth} (cids={batch_cids[:5]}"
+                f"{'...' if len(batch_cids) > 5 else ''}): {exc}",
+                file=sys.stderr,
+            )
+            raise
+        mid = len(batch_cids) // 2
+        left = _label_batch_with_retry(
+            batch_cids[:mid], batch_lines[:mid],
+            backend=backend, model=model, depth=depth + 1, max_depth=max_depth,
+        )
+        right = _label_batch_with_retry(
+            batch_cids[mid:], batch_lines[mid:],
+            backend=backend, model=model, depth=depth + 1, max_depth=max_depth,
+        )
+        return left | right
+
+
 def label_communities(
     G,
     communities,
@@ -2069,24 +2215,10 @@ def label_communities(
         end = min(start + batch_size, len(labeled_cids))
         batch_lines = lines[start:end]
         batch_cids = labeled_cids[start:end]
-
-        prompt = (
-            "You are naming clusters in a knowledge graph. For each community below, "
-            "return a concise 2-5 word plain-language name describing what it is about "
-            "(e.g. \"Order Management\", \"Payment Flow\", \"Auth Middleware\"). "
-            "Respond ONLY with a JSON object mapping the community id (as a string) to "
-            "its name - no prose, no markdown fences.\n\n" + "\n".join(batch_lines)
-        )
-        # 24 tok/community covers 2-5 word JSON entries including id, quotes,
-        # and punctuation. Cap at 8192 for 16k-context models. Wrapped in
-        # _resolve_max_tokens so GRAPHIFY_MAX_OUTPUT_TOKENS applies here too (#1200).
-        max_tokens = _resolve_max_tokens(min(64 + 24 * len(batch_cids), 8192))
         try:
-            call_kwargs = {"backend": backend, "max_tokens": max_tokens}
-            if model is not None:
-                call_kwargs["model"] = model
-            text = _call_llm(prompt, **call_kwargs)
-            parsed = _parse_label_response(text, batch_cids)
+            parsed = _label_batch_with_retry(
+                batch_cids, batch_lines, backend=backend, model=model,
+            )
             labels.update(parsed)
             written += len(parsed)
         except Exception as exc:

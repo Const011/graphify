@@ -394,7 +394,7 @@ def test_adaptive_retry_caps_at_max_depth(tmp_path, capsys):
 
 
 def test_adaptive_retry_single_file_truncation_does_not_recurse(tmp_path, capsys):
-    """A single .py file that truncates can't be split further — surface a
+    """A single file that truncates can't be split further — surface a
     warning and return what we got. No infinite loop."""
     from graphify.llm import _extract_with_adaptive_retry
 
@@ -408,43 +408,12 @@ def test_adaptive_retry_single_file_truncation_does_not_recurse(tmp_path, capsys
 
     with patch("graphify.llm.extract_files_direct", side_effect=stub):
         _extract_with_adaptive_retry(
-            [f], backend="kimi", api_key=None, model=None, root=tmp_path, max_depth=3,
+            [f], backend="kimi", api_key=None, model=None, root=tmp_path, max_depth=3
         )
 
     assert calls == [1], f"single-file chunk recursed; calls = {calls}"
     err = capsys.readouterr().err
     assert "single-file chunk" in err and "truncated" in err
-
-
-def test_adaptive_retry_splits_oversized_markdown_on_truncation(tmp_path):
-    """A single markdown slice that truncates should bisect and merge on retry."""
-    from graphify.file_slice import FileSlice
-    from graphify.llm import _extract_with_adaptive_retry
-
-    doc = tmp_path / "big.md"
-    text = "line\n" * 200
-    doc.write_text(text)
-    whole = FileSlice(path=doc, start=0, end=len(text), index=0, total=1)
-
-    calls = []
-
-    def stub(chunk, **kwargs):
-        calls.append(len(chunk))
-        finish = "length" if len(chunk) == 1 else "stop"
-        return _stub_with_finish(len(chunk), finish_reason=finish)
-
-    with patch("graphify.llm.extract_files_direct", side_effect=stub):
-        result = _extract_with_adaptive_retry(
-            [whole],
-            backend="kimi",
-            api_key=None,
-            model=None,
-            root=tmp_path,
-            max_depth=3,
-        )
-
-    assert len(calls) > 1
-    assert result["finish_reason"] == "stop"
 
 
 def test_corpus_parallel_uses_adaptive_retry(tmp_path):

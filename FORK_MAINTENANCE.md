@@ -21,7 +21,7 @@ Files that differ from upstream (fork-owned or pending upstream PR):
 |------|-------------|
 | `graphify/stitch.py` | Cross-file stitch (#1371 candidate) |
 | `graphify/llm_json_parser.py` | Gemma JSON recovery (#2 candidate) |
-| `graphify/llm.py` | Import parser; `GRAPHIFY_EXTRACTION_SUFFIX`; hollow guard; Gemma `reasoning_effort` skip |
+| `graphify/llm.py` | Import parser; `GRAPHIFY_EXTRACTION_SUFFIX`; hollow guard; Gemma `reasoning_effort` skip; **`_coerce_semantic_units`** (FileSlice pass-through — upstream #1369 gap) |
 | `graphify/__main__.py` | Manifest stamp; incremental `prune_sources`; incremental safety |
 | `graphify/build.py` | `path_covered_by_extraction` and path-alias helpers (manifest PR) |
 | `tests/test_stitch.py` | Stitch tests |
@@ -89,7 +89,9 @@ Init (no usable graph): processor **removes** `.pi/knowhow/graphify-out/` when `
 
 **Gemma `<thought>` preamble:** `gemma-4-31b-it` emits `<thought>…</thought>` (or unclosed `<thought>` before JSON). Not `<think>` — that is Cursor UI labelling, not model output.
 
-**Validated smoke (2026-06-18, small corpus):** `graphify-test/run-smoke-gemma.sh` — clustered extract; 24 nodes, 16 links, 8 communities, 8/8 files. Re-baseline after PMBOK8 + #1369 slicing with `run-smoke-gemma-detail-compare.sh`.
+**Validated smoke (2026-06-18, small corpus):** `graphify-test/run-smoke-gemma.sh` — clustered extract; 24 nodes, 16 links, 8 communities, 8/8 files.
+
+**PMBOK8 + slicing (2026-06-19):** `run-smoke-gemma-detail-compare.sh` with `--token-budget 16000` (`gemma-smoke-slice-16k`) — **125 nodes**, 113 edges, 35 communities, **99 PMBOK8 nodes** (vs 5 before #1369 + FileSlice fix). Default 60k budget / cluster vs `--no-cluster` still ~26 nodes — slicing only activates when pack yields `FileSlice` chunks. Requires fork `_coerce_semantic_units` (upstream 0.8.43 still coerces slices to `Path` and fails).
 
 ### Incidents fixed (2026-06-18, knowhow + fork)
 
@@ -99,6 +101,7 @@ Init (no usable graph): processor **removes** `.pi/knowhow/graphify-out/` when `
 | Second promoted doc wipes graph, full re-init | After first extract, `manifest.json` was `{}`; knowhow required non-empty manifest → **init + reset** | Fork `__main__.py` manifest stamp + knowhow `graphify_incremental_ready()` aligned with graphify gate |
 | Incremental re-extract, tokens spent, graph delta +0 | `_incremental_prune` included re-extracted paths; `build_merge` `prune_sources` deleted fresh nodes | Fork `__main__.py` — `prune_sources=deleted_files` only |
 | Large doc only partially extracted | Pre-#1369: `_FILE_CHAR_CAP` truncated unsplit files | **Upstream #1369** — slice before pack; fork takes upstream `file_slice.py` |
+| `--token-budget 16000` extract: all chunks fail `not 'FileSlice'` | Upstream #1369 packs `FileSlice` into chunks but `extract_files_direct` did `[Path(f) for f in files]` | Fork `llm.py` — `_coerce_semantic_units()`; regression in `tests/test_file_slice.py` |
 
 Knowhow patches (outside graphify git repo): `MVP6-knowledge-mgmt/ingest/knowhow/graphify_run_log.py`, `graphify_cli.py`, `graphify_trigger.py`; tests in `ingest/tests/test_graphify_*.py`.
 
